@@ -14,6 +14,15 @@ NP_TO_TORCH_DTYPES = {
     np.float64: torch.float64,
 }
 
+ALLOWED_SPLITS = {
+    # Regex for matching all columns excluding the ones in the dev and test splits
+    # using negative pattern matching
+    "train": r"(?!S4|S8|S15|S17).*",
+    "dev": r"(S4|S8)",
+    "test": r"(S15|S17)",
+    "full": r".*",
+}
+
 
 # Dataset for fMRI data that stores everything in memory
 class InMemoryRESTfMRIDataset(Dataset):
@@ -21,10 +30,11 @@ class InMemoryRESTfMRIDataset(Dataset):
         self,
         metadata_path="./REST-meta-MDD/metadata.csv",
         data_dir="./REST-meta-MDD/fMRI/AAL",
+        split="full",
     ):
         super(InMemoryRESTfMRIDataset, self).__init__()
-        self.cache_path = os.path.join("cache", data_dir)
-        metadata = pd.read_csv(metadata_path)
+        self.cache_path = os.path.join("cache", data_dir, split)
+        metadata = self._load_metadata(metadata_path, split)
 
         if self._cache_exists():
             self.edge_indices, self.node_features = self._load_cache()
@@ -37,6 +47,11 @@ class InMemoryRESTfMRIDataset(Dataset):
         self.num_samples = self.node_features.shape[0]
         self.num_nodes = self.node_features.shape[1]
         self.labels = torch.tensor(metadata.label.values)
+
+    def _load_metadata(self, metadata_path, split):
+        metadata = pd.read_csv(metadata_path)
+        cond = metadata.subID.str.match(ALLOWED_SPLITS[split])
+        return metadata[cond].reset_index(drop=True)
 
     def __len__(self):
         return self.num_samples
@@ -108,7 +123,7 @@ class InMemoryRESTfMRIDataset(Dataset):
 
 
 class RESTsMRIDataset(Dataset):
-    ALLOWED_SPLITS = [
+    IMAGE_TYPES = [
         "c1",  # Gray matter density in native space
         "c2",  # White matter density in native space
         "c3",  # Cerebrospinal fluid density in native space
@@ -123,18 +138,26 @@ class RESTsMRIDataset(Dataset):
     def __init__(
         self,
         data_dir="./REST-meta-MDD/REST-meta-MDD-VBM-Phase1-Sharing",
-        splits=["wc1"],  # Can be any combination of allowed splits (["wc1", "mwc1"...])
+        imgtypes=[
+            "wc1"
+        ],  # Can be any combination of allowed imgtypes (["wc1", "mwc1"...])
+        split="full",  # Can be "train", "dev", "test" or "full"
         normalize=True,  # Normalize images
         dtype=np.float32,  # Reduce to save memory
     ):
         super(RESTsMRIDataset, self).__init__()
-        splits = sorted(splits)
-        self.cache_path = os.path.join("cache", data_dir, "-".join(splits))
+        imgtypes = sorted(imgtypes)
+        self.cache_path = os.path.join("cache", data_dir, "-".join(imgtypes), split)
         self.normalize = normalize
         self.dtype = dtype
 
-        for split in splits:
-            assert split in self.ALLOWED_SPLITS, f"Split {split} not allowed"
+        for t in imgtypes:
+            assert t in self.IMAGE_TYPES, f"Image type {t} not allowed"
+
+    def _load_metadata(self, metadata_path, split):
+        metadata = pd.read_csv(metadata_path)
+        cond = metadata.subID.str.match(ALLOWED_SPLITS[split])
+        return metadata[cond].reset_index(drop=True)
 
 
 # It's faster but requires more memory. float32 precision takes around 13gb of memory space
@@ -143,14 +166,17 @@ class InMemoryRESTsMRIDataset(RESTsMRIDataset):
         self,
         metadata_path="./REST-meta-MDD/metadata.csv",
         data_dir="./REST-meta-MDD/REST-meta-MDD-VBM-Phase1-Sharing",
-        splits=["wc1"],  # Can be any combination of allowed splits (["wc1", "mwc1"...])
+        imgtypes=[
+            "wc1"
+        ],  # Can be any combination of allowed imgtypes (["wc1", "mwc1"...])
+        split="full",  # Can be "train", "dev", "test" or "full"
         normalize=True,  # Normalize images
         dtype=np.float32,  # Reduce to np.float16 to save memory
     ):
         super(InMemoryRESTsMRIDataset, self).__init__(
-            data_dir, splits, normalize, dtype
+            data_dir, imgtypes, split, normalize, dtype
         )
-        metadata = pd.read_csv(metadata_path)
+        metadata = self._load_metadata(metadata_path, split)
 
         if self._cache_exists():
             self.data = self._load_cache()
@@ -212,17 +238,22 @@ class LazyRESTsMRIDataset(RESTsMRIDataset):
         self,
         metadata_path="./REST-meta-MDD/metadata.csv",
         data_dir="./REST-meta-MDD/REST-meta-MDD-VBM-Phase1-Sharing",
-        splits=["wc1"],  # Can be any combination of allowed splits (["wc1", "mwc1"...])
+        imgtypes=[
+            "wc1"
+        ],  # Can be any combination of allowed imgtypes (["wc1", "mwc1"...])
+        split="full",  # Can be "train", "dev", "test" or "full"
         normalize=True,  # Normalize images
         dtype=np.float32,  # Reduce to save memory
     ):
-        super(LazyRESTsMRIDataset, self).__init__(data_dir, splits, normalize, dtype)
-        metadata = pd.read_csv(metadata_path)
+        super(LazyRESTsMRIDataset, self).__init__(
+            data_dir, imgtypes, split, normalize, dtype
+        )
+        metadata = self._load_metadata(metadata_path, split)
         self.ids = metadata.subID
         self.labels = torch.tensor(metadata.label.values)
 
         if not self._cache_exists():
-            self._create_cache(metadata, data_dir, splits)
+            self._create_cache(metadata, data_dir, imgtypes)
 
         self.num_samples = len(self.ids)
 
@@ -237,16 +268,16 @@ class LazyRESTsMRIDataset(RESTsMRIDataset):
             self.labels[idx],
         )
 
-    def _create_cache(self, metadata, data_dir, splits):
+    def _create_cache(self, metadata, data_dir, imgtypes):
         if not os.path.exists(self.cache_path):
             os.makedirs(self.cache_path)
 
-        dshape = self._get_data_shape(metadata, data_dir, splits)[1:]
+        dshape = self._get_data_shape(metadata, data_dir, imgtypes)[1:]
 
         for id in self.ids:
             dpoint = np.zeros(dshape, dtype=self.dtype)
 
-            for i, split in enumerate(splits):
+            for i, split in enumerate(imgtypes):
                 filepath = os.path.join(data_dir, split, f"{id}.nii.gz")
                 image = nib.load(filepath).get_fdata()
 
@@ -267,9 +298,9 @@ class LazyRESTsMRIDataset(RESTsMRIDataset):
 
         return True
 
-    def _get_data_shape(self, metadata, data_dir, splits):
+    def _get_data_shape(self, metadata, data_dir, imgtypes):
         id = metadata.subID[0]
-        split = splits[0]
-        filepath = os.path.join(data_dir, split, f"{id}.nii.gz")
+        imgtype = imgtypes[0]
+        filepath = os.path.join(data_dir, imgtype, f"{id}.nii.gz")
         image_shape = nib.load(filepath).get_fdata().shape
-        return (len(metadata), len(splits), *image_shape)
+        return (len(metadata), len(imgtypes), *image_shape)
