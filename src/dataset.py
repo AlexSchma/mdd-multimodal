@@ -25,14 +25,14 @@ ALLOWED_SPLITS = {
 
 
 # Dataset for fMRI data that stores everything in memory
-class InMemoryRESTfMRIDataset(Dataset):
+class RESTfMRIDataset(Dataset):
     def __init__(
         self,
         metadata_path="./REST-meta-MDD/metadata.csv",
         data_dir="./REST-meta-MDD/fMRI/AAL",
         split="full",
     ):
-        super(InMemoryRESTfMRIDataset, self).__init__()
+        super(RESTfMRIDataset, self).__init__()
         self.cache_path = os.path.join("cache", data_dir, split)
         metadata = self._load_metadata(metadata_path, split)
 
