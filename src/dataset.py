@@ -138,122 +138,33 @@ class RESTsMRIDataset(Dataset):
     def __init__(
         self,
         data_dir="./REST-meta-MDD/REST-meta-MDD-VBM-Phase1-Sharing",
+        metadata_path="./REST-meta-MDD/metadata.csv",
         imgtypes=[
             "wc1"
         ],  # Can be any combination of allowed imgtypes (["wc1", "mwc1"...])
         split="full",  # Can be "train", "dev", "test" or "full"
         normalize=True,  # Normalize images
         dtype=np.float32,  # Reduce to save memory
+        inmemory=False,  # Load everything in memory
     ):
         super(RESTsMRIDataset, self).__init__()
         imgtypes = sorted(imgtypes)
-        self.cache_path = os.path.join("cache", data_dir, "-".join(imgtypes), split)
+        metadata = self._load_metadata(metadata_path, split)
+        self.cache_path = os.path.join("cache", data_dir, "-".join(imgtypes))
         self.normalize = normalize
         self.dtype = dtype
-
-        for t in imgtypes:
-            assert t in self.IMAGE_TYPES, f"Image type {t} not allowed"
-
-    def _load_metadata(self, metadata_path, split):
-        metadata = pd.read_csv(metadata_path)
-        cond = metadata.subID.str.match(ALLOWED_SPLITS[split])
-        return metadata[cond].reset_index(drop=True)
-
-
-# It's faster but requires more memory. float32 precision takes around 13gb of memory space
-class InMemoryRESTsMRIDataset(RESTsMRIDataset):
-    def __init__(
-        self,
-        metadata_path="./REST-meta-MDD/metadata.csv",
-        data_dir="./REST-meta-MDD/REST-meta-MDD-VBM-Phase1-Sharing",
-        imgtypes=[
-            "wc1"
-        ],  # Can be any combination of allowed imgtypes (["wc1", "mwc1"...])
-        split="full",  # Can be "train", "dev", "test" or "full"
-        normalize=True,  # Normalize images
-        dtype=np.float32,  # Reduce to np.float16 to save memory
-    ):
-        super(InMemoryRESTsMRIDataset, self).__init__(
-            data_dir, imgtypes, split, normalize, dtype
-        )
-        metadata = self._load_metadata(metadata_path, split)
-
-        if self._cache_exists():
-            self.data = self._load_cache()
-        else:
-            self.data = self._preprocess_images(metadata, data_dir, splits)
-            self._save_cache()
-
-        self.num_samples = self.data.shape[0]
-        self.labels = torch.tensor(metadata.label.values)
-
-    def __len__(self):
-        return self.num_samples
-
-    def __getitem__(self, idx):
-        return self.data[idx], self.labels[idx]
-
-    def _preprocess_images(self, metadata, data_dir, splits):
-        data = np.zeros(
-            self._get_data_shape(metadata, data_dir, splits), dtype=self.dtype
-        )
-
-        for i, id in enumerate(metadata.subID):
-            for j, split in enumerate(splits):
-                filepath = os.path.join(data_dir, split, f"{id}.nii.gz")
-                image = nib.load(filepath).get_fdata()
-
-                if self.normalize:
-                    image -= image.mean()
-
-                data[i][j] = image
-
-        return torch.tensor(data)
-
-    def _save_cache(self):
-        if not os.path.exists(self.cache_path):
-            os.makedirs(self.cache_path)
-
-        data_path = os.path.join(self.cache_path, "data.pt")
-        torch.save(self.data, data_path)
-
-    def _cache_exists(self):
-        return os.path.exists(os.path.join(self.cache_path, "data.pt"))
-
-    def _load_cache(self):
-        data_path = os.path.join(self.cache_path, "data.pt")
-        return torch.load(data_path, weights_only=True)
-
-    def _get_data_shape(self, metadata, data_dir, splits):
-        id = metadata.subID[0]
-        split = splits[0]
-        filepath = os.path.join(data_dir, split, f"{id}.nii.gz")
-        image_shape = nib.load(filepath).get_fdata().shape
-        return (len(metadata), len(splits), *image_shape)
-
-
-# It's slower but requires much less memory
-class LazyRESTsMRIDataset(RESTsMRIDataset):
-    def __init__(
-        self,
-        metadata_path="./REST-meta-MDD/metadata.csv",
-        data_dir="./REST-meta-MDD/REST-meta-MDD-VBM-Phase1-Sharing",
-        imgtypes=[
-            "wc1"
-        ],  # Can be any combination of allowed imgtypes (["wc1", "mwc1"...])
-        split="full",  # Can be "train", "dev", "test" or "full"
-        normalize=True,  # Normalize images
-        dtype=np.float32,  # Reduce to save memory
-    ):
-        super(LazyRESTsMRIDataset, self).__init__(
-            data_dir, imgtypes, split, normalize, dtype
-        )
-        metadata = self._load_metadata(metadata_path, split)
         self.ids = metadata.subID
         self.labels = torch.tensor(metadata.label.values)
+        self.dshape = self._get_data_shape(data_dir, imgtypes)
 
         if not self._cache_exists():
-            self._create_cache(metadata, data_dir, imgtypes)
+            self._create_cache(data_dir, imgtypes)
+
+        if inmemory:
+            self._load_data_to_memory()
+            self.load_data_fn = self._inmemory_load_data
+        else:
+            self.load_data_fn = self._lazy_load_data
 
         self.num_samples = len(self.ids)
 
@@ -261,24 +172,36 @@ class LazyRESTsMRIDataset(RESTsMRIDataset):
         return self.num_samples
 
     def __getitem__(self, idx):
-        filename = self.ids[idx]
-        data = np.load(os.path.join(self.cache_path, f"{filename}.npy"))
-        return (
-            torch.tensor(data, dtype=NP_TO_TORCH_DTYPES[self.dtype]),
-            self.labels[idx],
-        )
+        return self.load_data_fn(idx)
 
-    def _create_cache(self, metadata, data_dir, imgtypes):
+    def _load_metadata(self, metadata_path, split):
+        metadata = pd.read_csv(metadata_path)
+        cond = metadata.subID.str.match(ALLOWED_SPLITS[split])
+        return metadata[cond].reset_index(drop=True)
+
+    def _cache_exists(self):
+        if not os.path.exists(self.cache_path):
+            return False
+
+        for subid in self.ids:
+            if not os.path.exists(os.path.join(self.cache_path, f"{subid}.npy")):
+                return False
+
+        return True
+
+    def _create_cache(self, data_dir, imgtypes):
         if not os.path.exists(self.cache_path):
             os.makedirs(self.cache_path)
 
-        dshape = self._get_data_shape(metadata, data_dir, imgtypes)[1:]
+        for subid in self.ids:
+            if os.path.exists(os.path.join(self.cache_path, f"{subid}.npy")):
+                continue
 
-        for id in self.ids:
-            dpoint = np.zeros(dshape, dtype=self.dtype)
+            dpoint = np.zeros(self.dshape[1:], dtype=self.dtype)
 
             for i, split in enumerate(imgtypes):
-                filepath = os.path.join(data_dir, split, f"{id}.nii.gz")
+
+                filepath = os.path.join(data_dir, split, f"{subid}.nii.gz")
                 image = nib.load(filepath).get_fdata()
 
                 if self.normalize:
@@ -286,21 +209,26 @@ class LazyRESTsMRIDataset(RESTsMRIDataset):
 
                 dpoint[i] = image
 
-            np.save(os.path.join(self.cache_path, f"{id}.npy"), dpoint)
+            np.save(os.path.join(self.cache_path, f"{subid}.npy"), dpoint)
 
-    def _cache_exists(self):
-        if not os.path.exists(self.cache_path):
-            return False
+    def _lazy_load_data(self, idx):
+        filename = self.ids[idx]
+        data = np.load(os.path.join(self.cache_path, f"{filename}.npy"))
+        data_t = torch.tensor(data, dtype=NP_TO_TORCH_DTYPES[self.dtype])
+        return data_t, self.labels[idx]
 
-        for id in self.ids:
-            if not os.path.exists(os.path.join(self.cache_path, f"{id}.npy")):
-                return False
+    def _inmemory_load_data(self, idx):
+        return self.data[idx], self.labels[idx]
 
-        return True
+    def _load_data_to_memory(self):
+        self.data = torch.zeros(self.dshape, dtype=NP_TO_TORCH_DTYPES[self.dtype])
+        for i, subid in enumerate(self.ids):
+            filepath = os.path.join(self.cache_path, f"{subid}.npy")
+            self.data[i] = torch.tensor(np.load(filepath))
 
-    def _get_data_shape(self, metadata, data_dir, imgtypes):
-        id = metadata.subID[0]
+    def _get_data_shape(self, data_dir, imgtypes):
+        subid = self.ids[0]
         imgtype = imgtypes[0]
-        filepath = os.path.join(data_dir, imgtype, f"{id}.nii.gz")
+        filepath = os.path.join(data_dir, imgtype, f"{subid}.nii.gz")
         image_shape = nib.load(filepath).get_fdata().shape
-        return (len(metadata), len(imgtypes), *image_shape)
+        return (len(self.ids), len(imgtypes), *image_shape)
