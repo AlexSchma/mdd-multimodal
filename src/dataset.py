@@ -5,8 +5,8 @@ import pandas as pd
 import torch
 
 from torch_geometric.utils import dense_to_sparse
+from torch_geometric.data import Data
 from torch.utils.data import Dataset
-
 
 NP_TO_TORCH_DTYPES = {
     np.float16: torch.float16,
@@ -17,9 +17,9 @@ NP_TO_TORCH_DTYPES = {
 ALLOWED_SPLITS = {
     # Regex for matching all columns excluding the ones in the dev and test splits
     # using negative pattern matching
-    "train": r"(?!S4|S8|S15|S17).*",
-    "dev": r"(S4|S8)",
-    "test": r"(S15|S17)",
+    "train": r"(?!(S4|S8|S15|S17)-).*",
+    "dev": r"((S4|S8)-)",
+    "test": r"((S15|S17)-)",
     "full": r".*",
 }
 
@@ -57,7 +57,11 @@ class RESTfMRIDataset(Dataset):
         return self.num_samples
 
     def __getitem__(self, idx):
-        return self.edge_indices[idx], self.node_features[idx], self.labels[idx]
+        return Data(
+            x=self.node_features[idx],
+            edge_index=self.edge_indices[idx],
+            y=self.labels[idx],
+        )
 
     def _preprocess_raw_signals(self, metadata, data_dir):
         adj_list = []
